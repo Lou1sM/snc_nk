@@ -1,5 +1,6 @@
 import numpy as np
 from dl_utils.label_funcs import get_num_labels
+from scipy import stats
 
 
 def cond_ent_for_alignment(x,y):
@@ -20,9 +21,9 @@ def combo_acc(cs1,cs2):
 
 def round_maybe_list(x,round_factor=100):
     if isinstance(x,float):
-        return round(round_factor*x,2)
+        return round(round_factor*float(x),2)
     elif isinstance(x,list):
-        return [round(round_factor*item,2) for item in x]
+        return [round(round_factor*float(item),2) for item in x]
     else: return x
 
 def normalize(x):

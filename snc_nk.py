@@ -11,13 +11,13 @@ from dl_utils.misc import check_dir
 from dl_utils.torch_misc import CifarLikeDataset
 from dl_utils.tensor_funcs import numpyify
 from dl_utils.label_funcs import get_num_labels, get_trans_dict, get_trans_dict_from_cost_mat
-from utils import normalize, load_trans_dict, np_ent
+from utils import normalize, load_trans_dict, np_ent, cond_ent_for_alignment, combo_acc, round_maybe_list
 
 
 class PredictorAligner():
-    def __init__(self,dset_name,vae_name,expname_str,test,max_epochs,verbose=False):
-        self.test = test
-        self.expname_str = expname_str
+    def __init__(self, dset_name, vae_name, expname, max_epochs, quick_run=False, verbose=False):
+        self.quick_run = quick_run
+        self.expname = expname
         self.dset_name = dset_name
         self.vae_name = vae_name
         self.max_epochs = max_epochs
@@ -25,12 +25,12 @@ class PredictorAligner():
         self.results = {'train': {}, 'test': {}}
         self.verbose = verbose
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.is_nt = not expname_str.startswith('zsc') and vae_name != 'hfs'
+        self.is_nt = not expname.startswith('zsc') and vae_name != 'hfs'
         check_dir('mi_mats')
         check_dir('trans_dicts')
 
-    def set_cost_mat(self,latents_,gts):
-        if self.test:
+    def set_cost_mat(self, latents_, gts):
+        if self.quick_run:
             self.cost_mat = np.random.rand(self.nz,self.n_factors)
         latents = normalize(latents_)
         assert latents.ndim == 2
@@ -51,12 +51,12 @@ class PredictorAligner():
         self.cost_mat = np.transpose(cost_mat_ - raw_ents) # transpose added because bug
         if self.verbose:
             print(self.cost_mat)
-        np.save(f'mi_mats/{self.dset_name}_mi_mat_{self.expname_str}.npy',self.cost_mat)
+        np.save(f'mi_mats/{self.dset_name}_mi_mat_{self.expname}.npy',self.cost_mat)
         if not self.cost_mat.max() <= 0.03: # -MI should be negative but error in computing entropy
             breakpoint()
 
-    def set_maybe_loaded_trans_dict(self,is_load=False,is_save=False):
-        possible_fpath = join('trans_dicts',f'{self.dset_name}_{self.vae_name}_trans_dict_{self.expname_str}.npy')
+    def set_maybe_loaded_trans_dict(self, is_load=False, is_save=False):
+        possible_fpath = join('trans_dicts',f'{self.dset_name}_{self.vae_name}_trans_dict_{self.expname}.npy')
         if is_load and os.path.isfile(possible_fpath):
             self.trans_dict = load_trans_dict(possible_fpath)
         else:
@@ -65,7 +65,7 @@ class PredictorAligner():
         if is_save:
             np.save(possible_fpath,np.array([[k,v] for k,v in self.trans_dict.items()]))
 
-    def set_data(self,latents,gts,latents_test,gts_test):
+    def set_data(self, latents, gts, latents_test, gts_test):
         assert latents.ndim == 2
         assert gts.ndim == 2
         assert latents_test.ndim == 2
@@ -79,8 +79,8 @@ class PredictorAligner():
         self.n_factors = self.gts.shape[1]
         self.nz = self.latents.shape[1]
 
-    def save_and_print_results(self,save_fpath):
-        if self.test:
+    def save_and_print_results(self, save_fpath):
+        if self.quick_run:
             save_fpath += '.test'
         if os.path.isfile(save_fpath):
             print(f'WARNING: accs file already exists at {save_fpath}')
@@ -96,7 +96,7 @@ class PredictorAligner():
         with open(save_fpath,'w') as f:
             json.dump(self.results,f)
 
-    def train_classif(self,x,y,x_test,y_test,is_mlp=True):
+    def train_classif(self, x, y, x_test, y_test, is_mlp=True):
         ngts = max(y.max(), y_test.max()) + 1
         if x.ndim == 1: x=np.expand_dims(x,1)
         if is_mlp:
@@ -106,8 +106,8 @@ class PredictorAligner():
         opt = Adam(fc.parameters(),lr=1e-2,weight_decay=0e-2)
         scheduler = lr_scheduler.ExponentialLR(opt,gamma=0.65)
 
-        assert not ((x_test == 'none') ^ (y_test=='none'))
-        if x_test == 'none':
+        assert not ((x_test == 'none').all() ^ (y_test=='none').all())
+        if (x_test == 'none').all():
             dset = CifarLikeDataset(x,y)
             len_trainset = int(len(x)*.8)
             lengths = [len_trainset,len(x)-len_trainset]
@@ -166,10 +166,10 @@ class PredictorAligner():
                 if tol == 4 and self.verbose:
                     print('breaking at', i)
                     break
-            if self.test: break
+            if self.quick_run: break
         return train_corrects, best_corrects
 
-    def simple_accs(self,x,y,xt,yt):
+    def simple_accs(self, x, y, xt, yt):
         num_classes = get_num_labels(y)
         bin_dividers = np.sort(x)[np.arange(0,len(x),len(x)/num_classes).astype(int)]
         bin_dividers[0] = min(bin_dividers[0],min(xt))
@@ -189,7 +189,7 @@ class PredictorAligner():
             test_corrects = (bin_vals_test==yt)
             return train_correctsa, test_corrects
 
-    def accs_from_alignment(self,is_single_neurons,is_mlp):
+    def accs_from_alignment(self, is_single_neurons, is_mlp):
         if is_single_neurons and not hasattr(self,'trans_dict'):
             self.set_maybe_loaded_trans_dict()
         all_train_corrects = []
@@ -210,7 +210,7 @@ class PredictorAligner():
             all_test_corrects.append(test_corrects)
         return all_train_corrects, all_test_corrects
 
-    def zs_combo_accs_from_corrects(self,all_cs):
+    def zs_combo_accs_from_corrects(self, all_cs):
         zs_acc = combo_acc(all_cs[self.zs_combo[0]],all_cs[self.zs_combo[1]])
         return [c.mean() for c in all_cs] + [zs_acc]
 
@@ -219,7 +219,7 @@ class PredictorAligner():
         x /= (x.std(axis=0)+1e-8)
         return x
 
-    def progressive_knockout(self,start_at):
+    def progressive_knockout(self, start_at):
         self.results['train']['full_knockouts'] = {k:{} for k in range(self.n_factors)}
         self.results['test']['full_knockouts'] = {k:{} for k in range(self.n_factors)}
         if not hasattr(self,'trans_dict'):
@@ -243,7 +243,7 @@ class PredictorAligner():
                 X_test = np.delete(X_test,latent_to_exclude,1)
                 cost_mat = np.delete(cost_mat,latent_to_exclude,1)
 
-    def exclusive_mlp(self,test_factor,exclude_factor,num_to_exclude):
+    def exclusive_mlp(self, test_factor, exclude_factor, num_to_exclude):
         first_latent_to_exclude = self.trans_dict[exclude_factor]
         X = np.delete(self.latents,first_latent_to_exclude,1)
         X_test = np.delete(self.latents_test,first_latent_to_exclude,1)
@@ -258,7 +258,7 @@ class PredictorAligner():
         y_test = self.gts_test[:,test_factor]
         return self.train_classif(X,y,X_test,y_test,is_mlp=True)
 
-    def set_cross_NK_results(self,num_to_exclude): # excl neuron for other zs feature
+    def set_cross_NK_results(self, num_to_exclude): # excl neuron for other zs feature
         if not hasattr(self,'trans_dict'):
             self.set_maybe_loaded_trans_dict()
         train_cs1, test_cs1 = self.exclusive_mlp(self.zs_combo[0],self.zs_combo[1],num_to_exclude)
@@ -272,7 +272,7 @@ class PredictorAligner():
         self.results['test'][f'e{num_to_exclude}f2'] = test_cs2.mean()
         self.results['test'][f'e{num_to_exclude}zs'] = zs_test_acc
 
-    def set_NK_results(self,num_to_exclude):
+    def set_NK_results(self, num_to_exclude):
         results_name = f're{num_to_exclude}'
         self.results['train'][results_name] = []
         self.results['test'][results_name] = []
@@ -282,8 +282,8 @@ class PredictorAligner():
                 self.results['train'][results_name].append(re_train_cs.mean())
                 self.results['test'][results_name].append(re_test_cs.mean())
 
-    def predict_unsupervised_vae(self,latents,gts,latents_test,gts_test):
-        if self.expname_str.startswith('exclf'):
+    def predict_unsupervised_vae(self, latents, gts, latents_test, gts_test):
+        if self.expname.startswith('exclf'):
             max_testset_size = min(1000000,len(latents_test))
             idxs = np.random.choice(np.arange(len(gts)+len(gts_test)),size=max_testset_size)
             x = np.concatenate([latents,latents_test])[idxs]
@@ -299,19 +299,19 @@ class PredictorAligner():
         if self.verbose:
             print('\nComputing NK')
         self.set_NK_results(num_to_exclude=1)
-        if self.expname_str.startswith('normal'):
+        if self.expname.startswith('normal'):
             self.set_cross_NK_results(num_to_exclude=1)
         if self.verbose:
             print('\nComputing full MLPs')
         self.set_full_accs_from_classif_func('none')
 
-    def default_full_classif_func_(self,is_mlp): # pvae used not use this, may not again in future
+    def default_full_classif_func_(self, is_mlp): # pvae used not use this,  may not again in future
         train_cs, test_cs = self.accs_from_alignment(is_single_neurons=False,is_mlp=is_mlp)
         train_accs = self.zs_combo_accs_from_corrects(train_cs)
         test_accs = self.zs_combo_accs_from_corrects(test_cs)
         return train_accs, test_accs
 
-    def set_full_accs_from_classif_func(self,classif_func):
+    def set_full_accs_from_classif_func(self, classif_func):
         if classif_func == 'none':
             classif_func = self.default_full_classif_func_
 
